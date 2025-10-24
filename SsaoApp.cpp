@@ -126,6 +126,9 @@ private:
 
 	std::array<const CD3DX12_STATIC_SAMPLER_DESC, 7> GetStaticSamplers();
     DirectX::XMFLOAT4X4 mJitteredProj = MathHelper::Identity4x4();
+    void ComputeTaaJitter();      // считает Halton, записывает mJitteredProj
+    void TaaResolvePass();        // отдельный проход TAA (fullscreen)
+
 
 private:
 
@@ -375,7 +378,6 @@ void SsaoApp::Update(const GameTimer& gt)
     // === Frame resource sync ===
     mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
     mCurrFrameResource = mFrameResources[mCurrFrameResourceIndex].get();
-
     if (mCurrFrameResource->Fence != 0 && mFence->GetCompletedValue() < mCurrFrameResource->Fence)
     {
         HANDLE eventHandle = CreateEventEx(nullptr, false, false, EVENT_ALL_ACCESS);
@@ -399,32 +401,15 @@ void SsaoApp::Update(const GameTimer& gt)
     UpdateMaterialBuffer(gt);
     UpdateShadowTransform(gt);
 
-    // === TAA jitter (усиленный, в пиксел€х) ===
-    float jitterX = (Halton(gTaa.HaltonIndex, 2) - 0.5f);
-    float jitterY = (Halton(gTaa.HaltonIndex, 3) - 0.5f);
-
-    gTaa.PrevJitter = gTaa.Jitter;
-    gTaa.Jitter = XMFLOAT2(jitterX, jitterY);
-
-    //  ороткий цикл Ч заметнее "дЄргает" (8 кадров). ’очешь м€гче Ч поставь 1024.
-    gTaa.HaltonIndex = (gTaa.HaltonIndex % 8) + 1;
-
-    XMFLOAT2 jitterUV(
-        (gTaa.Jitter.x * mTaaJitterPixels) / max(1, mClientWidth),
-        (gTaa.Jitter.y * mTaaJitterPixels) / max(1, mClientHeight));
-
-    // === ѕроекци€ + джиттер (сохраним на кадр) ===
-    mCamera.SetLens(0.25f * XM_PI, AspectRatio(), 1.0f, 1000.0f);
-    XMMATRIX proj = mCamera.GetProj();
-    proj.r[2].m128_f32[0] += jitterUV.x * 2.0f;   // dx в clip-space
-    proj.r[2].m128_f32[1] += jitterUV.y * -2.0f;  // dy в clip-space
-    XMStoreFloat4x4(&mJitteredProj, proj);
+    // === TAA jitter (только через функцию) ===
+    ComputeTaaJitter();
 
     // === ќстальные апдейты (используют mJitteredProj) ===
     UpdateMainPassCB(gt);
     UpdateShadowPassCB(gt);
     UpdateSsaoCB(gt);
 }
+
 
 
 
@@ -460,7 +445,7 @@ void SsaoApp::Draw(const GameTimer& gt)
     mSsao->ComputeSsao(mCommandList.Get(), mCurrFrameResource, 3);
 
     //
-    // Main pass ? BackBuffer (как было).
+    // Main pass ? BackBuffer.
     //
     mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 
@@ -474,9 +459,8 @@ void SsaoApp::Draw(const GameTimer& gt)
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
         CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
 
-    // очистка
+    // clear
     mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::LightSteelBlue, 0, nullptr);
-    // глубину Ќ≈ чистим Ч уже записали в DrawNormalsAndDepth
 
     mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
 
@@ -493,105 +477,17 @@ void SsaoApp::Draw(const GameTimer& gt)
     mCommandList->SetPipelineState(mPSOs["opaque"].Get());
     DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Opaque]);
 
-   // mCommandList->SetPipelineState(mPSOs["debug"].Get());
-   // DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Debug]);
+    // mCommandList->SetPipelineState(mPSOs["debug"].Get());
+    // DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Debug]);
 
     mCommandList->SetPipelineState(mPSOs["sky"].Get());
     DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Sky]);
 
     //
     // === TAA resolve ===
-    // Ўаг 1: копи€ текущего backbuffer в SRV-совместимый ресурс mCurrColorCopy
     //
-    {
-        auto src = CurrentBackBuffer();
-        auto dst = mCurrColorCopy.Get();
-        if (src && dst)
-        {
-            CD3DX12_RESOURCE_BARRIER pre[] =
-            {
-                CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
-            };
-            mCommandList->ResourceBarrier(_countof(pre), pre);
-
-            mCommandList->CopyResource(dst, src);
-
-            CD3DX12_RESOURCE_BARRIER post[] =
-            {
-                CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
-                CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
-            };
-            mCommandList->ResourceBarrier(_countof(post), post);
-        }
-    }
-
-    {
-        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        sd.Texture2D.MipLevels = 1;
-        sd.Texture2D.MostDetailedMip = 0;
-
-        // t0: текущий цвет (копи€ backbufferТа)
-        auto cpu0 = GetCpuSrv(mTaaHeapIndexStart + 0);
-        md3dDevice->CreateShaderResourceView(mCurrColorCopy.Get(), &sd, cpu0);
-
-        // t1: активна€ истори€
-        auto cpu1 = GetCpuSrv(mTaaHeapIndexStart + 1);
-        md3dDevice->CreateShaderResourceView(
-            (mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get()), &sd, cpu1);
-
-        // t2: пока не используетс€ Ч укажем на ту же историю (или depth, если добавишь)
-        auto cpu2 = GetCpuSrv(mTaaHeapIndexStart + 2);
-        md3dDevice->CreateShaderResourceView(
-            (mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get()), &sd, cpu2);
-        // === TAA resolve draw ===
-// ѕишем в backbuffer (он уже в RENDER_TARGET)
-        mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, nullptr);
-
-        // тот же root signature, но TAA-PSO
-        mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
-        auto passCB = mCurrFrameResource->PassCB->Resource();
-        mCommandList->SetGraphicsRootConstantBufferView(1, passCB->GetGPUVirtualAddress());
-
-        mCommandList->SetPipelineState(mTaaPSO.Get());
-
-        // slot 3 (таблица SRV) Ч указываем начало наших TAA-SRV (t0..t2)
-        mCommandList->SetGraphicsRootDescriptorTable(3, GetGpuSrv(mTaaHeapIndexStart));
-
-        // полноэкранный треугольник (VS без входного лэйаута)
-        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        mCommandList->DrawInstanced(3, 1, 0, 0);
-
-    }
-
-
-    // Ўаг 3: обновл€ем историю Ч копируем RESOLVED backbuffer ? активна€ history
-    {
-        auto src = CurrentBackBuffer();
-        auto dst = mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get();
-
-        CD3DX12_RESOURCE_BARRIER pre[] =
-        {
-            CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
-        };
-        mCommandList->ResourceBarrier(_countof(pre), pre);
-
-        mCommandList->CopyResource(dst, src);
-
-        CD3DX12_RESOURCE_BARRIER post[] =
-        {
-            CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
-            CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
-        };
-        mCommandList->ResourceBarrier(_countof(post), post);
-
-        // пинг-понг на след. кадр
-        mUseHistoryA = !mUseHistoryA;
-    }
+    if (mTaaEnabled)
+        TaaResolvePass();
 
     // backbuffer: RENDER_TARGET ? PRESENT
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
@@ -607,6 +503,7 @@ void SsaoApp::Draw(const GameTimer& gt)
     mCurrFrameResource->Fence = ++mCurrentFence;
     mCommandQueue->Signal(mFence.Get(), mCurrentFence);
 }
+
 
 
 void SsaoApp::OnMouseDown(WPARAM btnState, int x, int y)
@@ -762,7 +659,7 @@ void SsaoApp::UpdateShadowTransform(const GameTimer& gt)
 void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
 {
     XMMATRIX view = mCamera.GetView();
-    XMMATRIX proj = XMLoadFloat4x4(&mJitteredProj);   // ¬ј∆Ќќ: джиттерна€ проекци€
+    XMMATRIX proj = XMLoadFloat4x4(&mJitteredProj);   // джиттерна€ проекци€
     XMMATRIX viewProj = XMMatrixMultiply(view, proj);
     XMMATRIX invView = XMMatrixInverse(&XMMatrixDeterminant(view), view);
     XMMATRIX invProj = XMMatrixInverse(&XMMatrixDeterminant(proj), proj);
@@ -801,18 +698,101 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     mMainPassCB.Lights[2].Direction = mRotatedLightDirections[2];
     mMainPassCB.Lights[2].Strength = { 0.0f, 0.0f, 0.0f };
 
-    // === TAA-пол€ ===
+    // === TAA (UV) ===
     mMainPassCB.Jitter = gTaa.Jitter;
     mMainPassCB.PrevJitter = gTaa.PrevJitter;
     mMainPassCB.InvRT = XMFLOAT2(1.0f / max(1, mClientWidth), 1.0f / max(1, mClientHeight));
     mMainPassCB.TaaMode = mTaaViewMode;
     mMainPassCB.TaaEnabledInt = mTaaEnabled ? 1 : 0;
-    // mMainPassCB.TaaFeedback мен€етс€ хотке€ми U/J; можешь инициализировать его повыше при старте (0.9f)
 
     auto currPassCB = mCurrFrameResource->PassCB.get();
     currPassCB->CopyData(0, mMainPassCB);
 }
 
+
+
+void SsaoApp::TaaResolvePass()
+{
+    // 1) копи€ текущего backbuffer -> mCurrColorCopy
+    {
+        auto src = CurrentBackBuffer();
+        auto dst = mCurrColorCopy.Get();
+        if (src && dst)
+        {
+            CD3DX12_RESOURCE_BARRIER pre[] =
+            {
+                CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+            };
+            mCommandList->ResourceBarrier(_countof(pre), pre);
+            mCommandList->CopyResource(dst, src);
+            CD3DX12_RESOURCE_BARRIER post[] =
+            {
+                CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+            };
+            mCommandList->ResourceBarrier(_countof(post), post);
+        }
+    }
+
+    // 2) t0..t2 SRV
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        sd.Texture2D.MipLevels = 1;
+        sd.Texture2D.MostDetailedMip = 0;
+
+        // t0: curr color
+        md3dDevice->CreateShaderResourceView(mCurrColorCopy.Get(), &sd, GetCpuSrv(mTaaHeapIndexStart + 0));
+
+        // t1: history (активна€)
+        auto histAct = (mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get());
+        md3dDevice->CreateShaderResourceView(histAct, &sd, GetCpuSrv(mTaaHeapIndexStart + 1));
+
+        // t2: depth SRV Ч берЄм из SSAO-кучи (mSsaoHeapIndexStart+1)
+        md3dDevice->CopyDescriptorsSimple(
+            1,
+            GetCpuSrv(mTaaHeapIndexStart + 2),
+            GetCpuSrv(mSsaoHeapIndexStart + 1),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+
+    // 3) fullscreen TAA ? в текущий backbuffer
+    {
+        mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, nullptr);
+        mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+        auto passCB = mCurrFrameResource->PassCB->Resource();
+        mCommandList->SetGraphicsRootConstantBufferView(1, passCB->GetGPUVirtualAddress());
+        mCommandList->SetPipelineState(mTaaPSO.Get());
+        mCommandList->SetGraphicsRootDescriptorTable(3, GetGpuSrv(mTaaHeapIndexStart));
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mCommandList->DrawInstanced(3, 1, 0, 0);
+    }
+
+    // 4) обновл€ем историю (resolved backbuffer -> активна€ history)
+    {
+        auto src = CurrentBackBuffer();
+        auto dst = mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get();
+
+        CD3DX12_RESOURCE_BARRIER pre[] =
+        {
+            CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+        };
+        mCommandList->ResourceBarrier(_countof(pre), pre);
+        mCommandList->CopyResource(dst, src);
+        CD3DX12_RESOURCE_BARRIER post[] =
+        {
+            CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+        };
+        mCommandList->ResourceBarrier(_countof(post), post);
+
+        mUseHistoryA = !mUseHistoryA;
+    }
+}
 
 
 
@@ -1591,7 +1571,7 @@ void SsaoApp::BuildMaterials()
 
     auto tile0 = std::make_unique<Material>();
     tile0->Name = "tile0";
-    tile0->MatCBIndex = 2;
+    tile0->MatCBIndex = 1;
     tile0->DiffuseSrvHeapIndex = 2;
     tile0->NormalSrvHeapIndex = 3;
     tile0->DiffuseAlbedo = XMFLOAT4(0.9f, 0.9f, 0.9f, 1.0f);
@@ -1600,7 +1580,7 @@ void SsaoApp::BuildMaterials()
 
     auto mirror0 = std::make_unique<Material>();
     mirror0->Name = "mirror0";
-    mirror0->MatCBIndex = 3;
+    mirror0->MatCBIndex = 2;
     mirror0->DiffuseSrvHeapIndex = 4;
     mirror0->NormalSrvHeapIndex = 5;
     mirror0->DiffuseAlbedo = XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -1632,22 +1612,23 @@ void SsaoApp::BuildMaterials()
     mMaterials["sky"] = std::move(sky);
 }
 
+
 void SsaoApp::BuildRenderItems()
 {
-	auto skyRitem = std::make_unique<RenderItem>();
-	XMStoreFloat4x4(&skyRitem->World, XMMatrixScaling(5000.0f, 5000.0f, 5000.0f));
-	skyRitem->TexTransform = MathHelper::Identity4x4();
-	skyRitem->ObjCBIndex = 0;
-	skyRitem->Mat = mMaterials["sky"].get();
-	skyRitem->Geo = mGeometries["shapeGeo"].get();
-	skyRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-	skyRitem->IndexCount = skyRitem->Geo->DrawArgs["sphere"].IndexCount;
-	skyRitem->StartIndexLocation = skyRitem->Geo->DrawArgs["sphere"].StartIndexLocation;
-	skyRitem->BaseVertexLocation = skyRitem->Geo->DrawArgs["sphere"].BaseVertexLocation;
+    auto skyRitem = std::make_unique<RenderItem>();
+    XMStoreFloat4x4(&skyRitem->World, XMMatrixScaling(5000.0f, 5000.0f, 5000.0f));
+    skyRitem->TexTransform = MathHelper::Identity4x4();
+    skyRitem->ObjCBIndex = 0;
+    skyRitem->Mat = mMaterials["sky"].get();
+    skyRitem->Geo = mGeometries["shapeGeo"].get();
+    skyRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    skyRitem->IndexCount = skyRitem->Geo->DrawArgs["sphere"].IndexCount;
+    skyRitem->StartIndexLocation = skyRitem->Geo->DrawArgs["sphere"].StartIndexLocation;
+    skyRitem->BaseVertexLocation = skyRitem->Geo->DrawArgs["sphere"].BaseVertexLocation;
 
-	mRitemLayer[(int)RenderLayer::Sky].push_back(skyRitem.get());
-	mAllRitems.push_back(std::move(skyRitem));
-    
+    mRitemLayer[(int)RenderLayer::Sky].push_back(skyRitem.get());
+    mAllRitems.push_back(std::move(skyRitem));
+
     auto quadRitem = std::make_unique<RenderItem>();
     quadRitem->World = MathHelper::Identity4x4();
     quadRitem->TexTransform = MathHelper::Identity4x4();
@@ -1661,23 +1642,23 @@ void SsaoApp::BuildRenderItems()
 
     mRitemLayer[(int)RenderLayer::Debug].push_back(quadRitem.get());
     mAllRitems.push_back(std::move(quadRitem));
-    
-	auto boxRitem = std::make_unique<RenderItem>();
-	XMStoreFloat4x4(&boxRitem->World, XMMatrixScaling(2.0f, 1.0f, 2.0f)*XMMatrixTranslation(0.0f, 0.5f, 0.0f));
-	XMStoreFloat4x4(&boxRitem->TexTransform, XMMatrixScaling(1.0f, 0.5f, 1.0f));
-	boxRitem->ObjCBIndex = 2;
-	boxRitem->Mat = mMaterials["bricks0"].get();
-	boxRitem->Geo = mGeometries["shapeGeo"].get();
-	boxRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-	boxRitem->IndexCount = boxRitem->Geo->DrawArgs["box"].IndexCount;
-	boxRitem->StartIndexLocation = boxRitem->Geo->DrawArgs["box"].StartIndexLocation;
-	boxRitem->BaseVertexLocation = boxRitem->Geo->DrawArgs["box"].BaseVertexLocation;
 
-	mRitemLayer[(int)RenderLayer::Opaque].push_back(boxRitem.get());
-	mAllRitems.push_back(std::move(boxRitem));
+    auto boxRitem = std::make_unique<RenderItem>();
+    XMStoreFloat4x4(&boxRitem->World, XMMatrixScaling(2.0f, 1.0f, 2.0f) * XMMatrixTranslation(0.0f, 0.5f, 0.0f));
+    XMStoreFloat4x4(&boxRitem->TexTransform, XMMatrixScaling(1.0f, 0.5f, 1.0f));
+    boxRitem->ObjCBIndex = 2;
+    boxRitem->Mat = mMaterials["bricks0"].get();
+    boxRitem->Geo = mGeometries["shapeGeo"].get();
+    boxRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    boxRitem->IndexCount = boxRitem->Geo->DrawArgs["box"].IndexCount;
+    boxRitem->StartIndexLocation = boxRitem->Geo->DrawArgs["box"].StartIndexLocation;
+    boxRitem->BaseVertexLocation = boxRitem->Geo->DrawArgs["box"].BaseVertexLocation;
+
+    mRitemLayer[(int)RenderLayer::Opaque].push_back(boxRitem.get());
+    mAllRitems.push_back(std::move(boxRitem));
 
     auto skullRitem = std::make_unique<RenderItem>();
-    XMStoreFloat4x4(&skullRitem->World, XMMatrixScaling(0.4f, 0.4f, 0.4f)*XMMatrixTranslation(0.0f, 1.0f, 0.0f));
+    XMStoreFloat4x4(&skullRitem->World, XMMatrixScaling(0.4f, 0.4f, 0.4f) * XMMatrixTranslation(0.0f, 1.0f, 0.0f));
     skullRitem->TexTransform = MathHelper::Identity4x4();
     skullRitem->ObjCBIndex = 3;
     skullRitem->Mat = mMaterials["skullMat"].get();
@@ -1687,89 +1668,91 @@ void SsaoApp::BuildRenderItems()
     skullRitem->StartIndexLocation = skullRitem->Geo->DrawArgs["skull"].StartIndexLocation;
     skullRitem->BaseVertexLocation = skullRitem->Geo->DrawArgs["skull"].BaseVertexLocation;
 
-	mRitemLayer[(int)RenderLayer::Opaque].push_back(skullRitem.get());
-	mAllRitems.push_back(std::move(skullRitem));
+    mRitemLayer[(int)RenderLayer::Opaque].push_back(skullRitem.get());
+    mAllRitems.push_back(std::move(skullRitem));
 
     auto gridRitem = std::make_unique<RenderItem>();
     gridRitem->World = MathHelper::Identity4x4();
-	XMStoreFloat4x4(&gridRitem->TexTransform, XMMatrixScaling(8.0f, 8.0f, 1.0f));
-	gridRitem->ObjCBIndex = 4;
-	gridRitem->Mat = mMaterials["tile0"].get();
-	gridRitem->Geo = mGeometries["shapeGeo"].get();
-	gridRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    XMStoreFloat4x4(&gridRitem->TexTransform, XMMatrixScaling(8.0f, 8.0f, 1.0f));
+    gridRitem->ObjCBIndex = 4;
+    gridRitem->Mat = mMaterials["tile0"].get();
+    gridRitem->Geo = mGeometries["shapeGeo"].get();
+    gridRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     gridRitem->IndexCount = gridRitem->Geo->DrawArgs["grid"].IndexCount;
     gridRitem->StartIndexLocation = gridRitem->Geo->DrawArgs["grid"].StartIndexLocation;
     gridRitem->BaseVertexLocation = gridRitem->Geo->DrawArgs["grid"].BaseVertexLocation;
 
-	mRitemLayer[(int)RenderLayer::Opaque].push_back(gridRitem.get());
-	mAllRitems.push_back(std::move(gridRitem));
+    mRitemLayer[(int)RenderLayer::Opaque].push_back(gridRitem.get());
+    mAllRitems.push_back(std::move(gridRitem));
 
-	XMMATRIX brickTexTransform = XMMatrixScaling(1.5f, 2.0f, 1.0f);
-	UINT objCBIndex = 5;
-	for(int i = 0; i < 5; ++i)
-	{
-		auto leftCylRitem = std::make_unique<RenderItem>();
-		auto rightCylRitem = std::make_unique<RenderItem>();
-		auto leftSphereRitem = std::make_unique<RenderItem>();
-		auto rightSphereRitem = std::make_unique<RenderItem>();
+    XMMATRIX brickTexTransform = XMMatrixScaling(1.5f, 2.0f, 1.0f);
+    UINT objCBIndex = 5;
+    for (int i = 0; i < 5; ++i)
+    {
+        auto leftCylRitem = std::make_unique<RenderItem>();
+        auto rightCylRitem = std::make_unique<RenderItem>();
+        auto leftSphereRitem = std::make_unique<RenderItem>();
+        auto rightSphereRitem = std::make_unique<RenderItem>();
 
-		XMMATRIX leftCylWorld = XMMatrixTranslation(-5.0f, 1.5f, -10.0f + i*5.0f);
-		XMMATRIX rightCylWorld = XMMatrixTranslation(+5.0f, 1.5f, -10.0f + i*5.0f);
+        XMMATRIX leftCylWorld = XMMatrixTranslation(-5.0f, 1.5f, -10.0f + i * 5.0f);
+        XMMATRIX rightCylWorld = XMMatrixTranslation(+5.0f, 1.5f, -10.0f + i * 5.0f);
 
-		XMMATRIX leftSphereWorld = XMMatrixTranslation(-5.0f, 3.5f, -10.0f + i*5.0f);
-		XMMATRIX rightSphereWorld = XMMatrixTranslation(+5.0f, 3.5f, -10.0f + i*5.0f);
+        XMMATRIX leftSphereWorld = XMMatrixTranslation(-5.0f, 3.5f, -10.0f + i * 5.0f);
+        XMMATRIX rightSphereWorld = XMMatrixTranslation(+5.0f, 3.5f, -10.0f + i * 5.0f);
 
-		XMStoreFloat4x4(&leftCylRitem->World, rightCylWorld);
-		XMStoreFloat4x4(&leftCylRitem->TexTransform, brickTexTransform);
-		leftCylRitem->ObjCBIndex = objCBIndex++;
-		leftCylRitem->Mat = mMaterials["bricks0"].get();
-		leftCylRitem->Geo = mGeometries["shapeGeo"].get();
-		leftCylRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		leftCylRitem->IndexCount = leftCylRitem->Geo->DrawArgs["cylinder"].IndexCount;
-		leftCylRitem->StartIndexLocation = leftCylRitem->Geo->DrawArgs["cylinder"].StartIndexLocation;
-		leftCylRitem->BaseVertexLocation = leftCylRitem->Geo->DrawArgs["cylinder"].BaseVertexLocation;
+        // ‘икс: левому Ч leftCylWorld, правому Ч rightCylWorld.
+        XMStoreFloat4x4(&leftCylRitem->World, leftCylWorld);
+        XMStoreFloat4x4(&leftCylRitem->TexTransform, brickTexTransform);
+        leftCylRitem->ObjCBIndex = objCBIndex++;
+        leftCylRitem->Mat = mMaterials["bricks0"].get();
+        leftCylRitem->Geo = mGeometries["shapeGeo"].get();
+        leftCylRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        leftCylRitem->IndexCount = leftCylRitem->Geo->DrawArgs["cylinder"].IndexCount;
+        leftCylRitem->StartIndexLocation = leftCylRitem->Geo->DrawArgs["cylinder"].StartIndexLocation;
+        leftCylRitem->BaseVertexLocation = leftCylRitem->Geo->DrawArgs["cylinder"].BaseVertexLocation;
 
-		XMStoreFloat4x4(&rightCylRitem->World, leftCylWorld);
-		XMStoreFloat4x4(&rightCylRitem->TexTransform, brickTexTransform);
-		rightCylRitem->ObjCBIndex = objCBIndex++;
-		rightCylRitem->Mat = mMaterials["bricks0"].get();
-		rightCylRitem->Geo = mGeometries["shapeGeo"].get();
-		rightCylRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		rightCylRitem->IndexCount = rightCylRitem->Geo->DrawArgs["cylinder"].IndexCount;
-		rightCylRitem->StartIndexLocation = rightCylRitem->Geo->DrawArgs["cylinder"].StartIndexLocation;
-		rightCylRitem->BaseVertexLocation = rightCylRitem->Geo->DrawArgs["cylinder"].BaseVertexLocation;
+        XMStoreFloat4x4(&rightCylRitem->World, rightCylWorld);
+        XMStoreFloat4x4(&rightCylRitem->TexTransform, brickTexTransform);
+        rightCylRitem->ObjCBIndex = objCBIndex++;
+        rightCylRitem->Mat = mMaterials["bricks0"].get();
+        rightCylRitem->Geo = mGeometries["shapeGeo"].get();
+        rightCylRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        rightCylRitem->IndexCount = rightCylRitem->Geo->DrawArgs["cylinder"].IndexCount;
+        rightCylRitem->StartIndexLocation = rightCylRitem->Geo->DrawArgs["cylinder"].StartIndexLocation;
+        rightCylRitem->BaseVertexLocation = rightCylRitem->Geo->DrawArgs["cylinder"].BaseVertexLocation;
 
-		XMStoreFloat4x4(&leftSphereRitem->World, leftSphereWorld);
-		leftSphereRitem->TexTransform = MathHelper::Identity4x4();
-		leftSphereRitem->ObjCBIndex = objCBIndex++;
-		leftSphereRitem->Mat = mMaterials["mirror0"].get();
-		leftSphereRitem->Geo = mGeometries["shapeGeo"].get();
-		leftSphereRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		leftSphereRitem->IndexCount = leftSphereRitem->Geo->DrawArgs["sphere"].IndexCount;
-		leftSphereRitem->StartIndexLocation = leftSphereRitem->Geo->DrawArgs["sphere"].StartIndexLocation;
-		leftSphereRitem->BaseVertexLocation = leftSphereRitem->Geo->DrawArgs["sphere"].BaseVertexLocation;
+        XMStoreFloat4x4(&leftSphereRitem->World, leftSphereWorld);
+        leftSphereRitem->TexTransform = MathHelper::Identity4x4();
+        leftSphereRitem->ObjCBIndex = objCBIndex++;
+        leftSphereRitem->Mat = mMaterials["mirror0"].get();
+        leftSphereRitem->Geo = mGeometries["shapeGeo"].get();
+        leftSphereRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        leftSphereRitem->IndexCount = leftSphereRitem->Geo->DrawArgs["sphere"].IndexCount;
+        leftSphereRitem->StartIndexLocation = leftSphereRitem->Geo->DrawArgs["sphere"].StartIndexLocation;
+        leftSphereRitem->BaseVertexLocation = leftSphereRitem->Geo->DrawArgs["sphere"].BaseVertexLocation;
 
-		XMStoreFloat4x4(&rightSphereRitem->World, rightSphereWorld);
-		rightSphereRitem->TexTransform = MathHelper::Identity4x4();
-		rightSphereRitem->ObjCBIndex = objCBIndex++;
-		rightSphereRitem->Mat = mMaterials["mirror0"].get();
-		rightSphereRitem->Geo = mGeometries["shapeGeo"].get();
-		rightSphereRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		rightSphereRitem->IndexCount = rightSphereRitem->Geo->DrawArgs["sphere"].IndexCount;
-		rightSphereRitem->StartIndexLocation = rightSphereRitem->Geo->DrawArgs["sphere"].StartIndexLocation;
-		rightSphereRitem->BaseVertexLocation = rightSphereRitem->Geo->DrawArgs["sphere"].BaseVertexLocation;
+        XMStoreFloat4x4(&rightSphereRitem->World, rightSphereWorld);
+        rightSphereRitem->TexTransform = MathHelper::Identity4x4();
+        rightSphereRitem->ObjCBIndex = objCBIndex++;
+        rightSphereRitem->Mat = mMaterials["mirror0"].get();
+        rightSphereRitem->Geo = mGeometries["shapeGeo"].get();
+        rightSphereRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        rightSphereRitem->IndexCount = rightSphereRitem->Geo->DrawArgs["sphere"].IndexCount;
+        rightSphereRitem->StartIndexLocation = rightSphereRitem->Geo->DrawArgs["sphere"].StartIndexLocation;
+        rightSphereRitem->BaseVertexLocation = rightSphereRitem->Geo->DrawArgs["sphere"].BaseVertexLocation;
 
-		mRitemLayer[(int)RenderLayer::Opaque].push_back(leftCylRitem.get());
-		mRitemLayer[(int)RenderLayer::Opaque].push_back(rightCylRitem.get());
-		mRitemLayer[(int)RenderLayer::Opaque].push_back(leftSphereRitem.get());
-		mRitemLayer[(int)RenderLayer::Opaque].push_back(rightSphereRitem.get());
+        mRitemLayer[(int)RenderLayer::Opaque].push_back(leftCylRitem.get());
+        mRitemLayer[(int)RenderLayer::Opaque].push_back(rightCylRitem.get());
+        mRitemLayer[(int)RenderLayer::Opaque].push_back(leftSphereRitem.get());
+        mRitemLayer[(int)RenderLayer::Opaque].push_back(rightSphereRitem.get());
 
-		mAllRitems.push_back(std::move(leftCylRitem));
-		mAllRitems.push_back(std::move(rightCylRitem));
-		mAllRitems.push_back(std::move(leftSphereRitem));
-		mAllRitems.push_back(std::move(rightSphereRitem));
-	}
+        mAllRitems.push_back(std::move(leftCylRitem));
+        mAllRitems.push_back(std::move(rightCylRitem));
+        mAllRitems.push_back(std::move(leftSphereRitem));
+        mAllRitems.push_back(std::move(rightSphereRitem));
+    }
 }
+
 
 void SsaoApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vector<RenderItem*>& ritems)
 {
@@ -1824,6 +1807,34 @@ void SsaoApp::DrawSceneToShadowMap()
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap->Resource(),
         D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ));
 }
+void SsaoApp::ComputeTaaJitter()
+{
+    // Halton jitter in [-0.5, 0.5]
+    float jx = (Halton(gTaa.HaltonIndex, 2) - 0.5f);
+    float jy = (Halton(gTaa.HaltonIndex, 3) - 0.5f);
+
+    //  оротка€ последовательность дл€ нагл€дности; можно 1024 дл€ более м€гкого шума.
+    gTaa.HaltonIndex = (gTaa.HaltonIndex % 8) + 1;
+
+    // ѕереводим в UV с учЄтом амплитуды (в пиксел€х) и размеров RT
+    XMFLOAT2 jitterUV(
+        (jx * mTaaJitterPixels) / max(1, mClientWidth),
+        (jy * mTaaJitterPixels) / max(1, mClientHeight));
+
+    // —охран€ем в PassCB как UV (а не Ђсырыеї Halton)
+    gTaa.PrevJitter = gTaa.Jitter;
+    gTaa.Jitter = jitterUV;
+
+    // —мещение проекции в clip-space (UV -> clip; учтЄм инверсию Y)
+    mCamera.SetLens(0.25f * XM_PI, AspectRatio(), 1.0f, 1000.0f);
+    XMMATRIX proj = mCamera.GetProj();
+    proj.r[2].m128_f32[0] += jitterUV.x * 2.0f;
+    proj.r[2].m128_f32[1] += jitterUV.y * -2.0f;
+    XMStoreFloat4x4(&mJitteredProj, proj);
+}
+
+
+
  
 void SsaoApp::DrawNormalsAndDepth()
 {
@@ -1955,4 +1966,7 @@ std::array<const CD3DX12_STATIC_SAMPLER_DESC, 7> SsaoApp::GetStaticSamplers()
         shadow 
     };
 }
+
+
+
 
