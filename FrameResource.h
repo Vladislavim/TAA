@@ -24,8 +24,10 @@ struct PassConstants
     DirectX::XMFLOAT4X4 InvViewProj = MathHelper::Identity4x4();
     DirectX::XMFLOAT4X4 ViewProjTex = MathHelper::Identity4x4();
     DirectX::XMFLOAT4X4 ShadowTransform = MathHelper::Identity4x4();
+
     DirectX::XMFLOAT3 EyePosW = { 0.0f, 0.0f, 0.0f };
     float cbPerObjectPad1 = 0.0f;
+
     DirectX::XMFLOAT2 RenderTargetSize = { 0.0f, 0.0f };
     DirectX::XMFLOAT2 InvRenderTargetSize = { 0.0f, 0.0f };
     float NearZ = 0.0f;
@@ -34,26 +36,28 @@ struct PassConstants
     float DeltaTime = 0.0f;
 
     DirectX::XMFLOAT4 AmbientLight = { 0.0f, 0.0f, 0.0f, 1.0f };
-
-    // Indices [0, NUM_DIR_LIGHTS) are directional lights;
-    // indices [NUM_DIR_LIGHTS, NUM_DIR_LIGHTS+NUM_POINT_LIGHTS) are point lights;
-    // indices [NUM_DIR_LIGHTS+NUM_POINT_LIGHTS, NUM_DIR_LIGHTS+NUM_POINT_LIGHT+NUM_SPOT_LIGHTS)
-    // are spot lights for a maximum of MaxLights per object.
     Light Lights[MaxLights];
-    // TAA BEGIN: PassConstants additions
+
+    // TAA BEGIN
     DirectX::XMFLOAT4X4 PrevViewProj = MathHelper::Identity4x4();
     DirectX::XMFLOAT2   Jitter = { 0.0f, 0.0f };
     DirectX::XMFLOAT2   PrevJitter = { 0.0f, 0.0f };
     DirectX::XMFLOAT2   InvRT = { 1.0f, 1.0f };
     float               TaaFeedback = 0.9f;
     float               TaaDepthThresh = 0.005f;
-
+    int                 TaaMode = 0;        // 0=Final,1=NoTAA,2=ShowHistory,3=ShowDiff,4=DebugSkull
+    int                 TaaEnabledInt = 1;  // 1=ON, 0=OFF
+    DirectX::XMFLOAT2   _taaPad = { 0,0 };
     // TAA END
-    int   TaaMode = 0; // 0=Final, 1=NoTAA, 2=ShowHistory, 3=ShowDiff
-    int   TaaEnabledInt = 1; // 1=ON, 0=OFF
-    DirectX::XMFLOAT2 _taaPad = { 0,0 };
 
+    // === Debug skull (для подсветки/оверлея в TAA) ===
+    DirectX::XMFLOAT3   SkullCenterWS = { 0,0,0 };
+    float               SkullRadius = 0.0f;
+    DirectX::XMFLOAT4X4 InvSkullWorld = MathHelper::Identity4x4(); // world^-1 черепа (транспонированная для HLSL)
+    DirectX::XMFLOAT3   SkullExtentsLS = { 0,0,0 };  // половинные размеры локального AABB (опционально)
+    float               _skullPad = 0.0f;          // паддинг
 };
+
 
 struct SsaoConstants
 {
