@@ -126,7 +126,7 @@ public:
     ~SsaoApp();
 
     virtual bool Initialize()override;
-    float mTaaJitterPixels = 2.0f;
+    float mTaaJitterPixels = 0.5f;
 
 private:
     virtual void CreateRtvAndDsvDescriptorHeaps()override;
@@ -259,6 +259,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mTaaPSOStencil; // PSO для TAA со stencil==1
     float mSkullMoveTime = 0.0f;
     bool mTaaHistoryValid = false;
+    bool mHasPrevViewProj = false;
 
 };
 
@@ -769,6 +770,15 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     XMMATRIX viewProjTex = XMMatrixMultiply(viewProj, T);
     XMMATRIX shadowTransform = XMLoadFloat4x4(&mShadowTransform);
 
+    // === NEW: держим предыдущую ViewProj (в том же TP-виде, как и другие матрицы в CB)
+    static XMFLOAT4X4 sPrevViewProj = MathHelper::Identity4x4();
+    if (!mHasPrevViewProj)
+    {
+        XMStoreFloat4x4(&sPrevViewProj, XMMatrixTranspose(viewProj)); // на первом кадре prev = current
+        mHasPrevViewProj = true;
+    }
+    mMainPassCB.PrevViewProj = sPrevViewProj; // положили прошлую в CB
+
     XMStoreFloat4x4(&mMainPassCB.View, XMMatrixTranspose(view));
     XMStoreFloat4x4(&mMainPassCB.InvView, XMMatrixTranspose(invView));
     XMStoreFloat4x4(&mMainPassCB.Proj, XMMatrixTranspose(proj));
@@ -802,29 +812,25 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     mMainPassCB.TaaFeedback = MathHelper::Clamp(mMainPassCB.TaaFeedback, 0.0f, 0.99f);
 
     auto currPassCB = mCurrFrameResource->PassCB.get();
-    // === SKULL debug data for TAA ===
+
+    // === DEBUG-данные для skull (оставил как у тебя) ===
     if (mSkullRitem)
     {
-        // локальные границы меша
         const auto& skullSub = mGeometries["skullGeo"]->DrawArgs["skull"];
         const DirectX::XMFLOAT3 cLS = skullSub.Bounds.Center;
         const DirectX::XMFLOAT3 eLS = skullSub.Bounds.Extents;
 
-        // текущий world черепа
         DirectX::XMMATRIX W = XMLoadFloat4x4(&mSkullRitem->World);
 
-        // центр в мире
         DirectX::XMVECTOR cWSv = XMVector3TransformCoord(XMLoadFloat3(&cLS), W);
         XMStoreFloat3(&mMainPassCB.SkullCenterWS, cWSv);
 
-        // оценка радиуса в мире (по масштабам базисов)
         float sx = XMVectorGetX(XMVector3Length(W.r[0]));
         float sy = XMVectorGetX(XMVector3Length(W.r[1]));
         float sz = XMVectorGetX(XMVector3Length(W.r[2]));
         DirectX::XMFLOAT3 eWS = { eLS.x * sx, eLS.y * sy, eLS.z * sz };
         mMainPassCB.SkullRadius = std::sqrt(eWS.x * eWS.x + eWS.y * eWS.y + eWS.z * eWS.z);
 
-        // для точного AABB-теста: инверсия world (TP для HLSL) + локальные экстенты
         DirectX::XMMATRIX invW = XMMatrixInverse(nullptr, W);
         XMStoreFloat4x4(&mMainPassCB.InvSkullWorld, XMMatrixTranspose(invW));
         mMainPassCB.SkullExtentsLS = eLS;
@@ -838,7 +844,11 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     }
 
     currPassCB->CopyData(0, mMainPassCB);
+
+    // === готовим PrevViewProj на следующий кадр (в TP-виде) ===
+    XMStoreFloat4x4(&sPrevViewProj, XMMatrixTranspose(viewProj));
 }
+
 
 
 
@@ -887,9 +897,7 @@ void SsaoApp::TaaResolvePass()
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Texture2D.MipLevels = 1;
         sd.Texture2D.MostDetailedMip = 0;
-
-        // формат SRV совместимый с бэкбуфером
-        sd.Format = ToNonSRGB(mBackBufferFormat);
+        sd.Format = ToNonSRGB(mBackBufferFormat); // SRV формат совместим с bb
 
         // t0: curr
         md3dDevice->CreateShaderResourceView(mCurrColorCopy.Get(), &sd, GetCpuSrv(mTaaHeapIndexStart + 0));
@@ -906,21 +914,33 @@ void SsaoApp::TaaResolvePass()
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
-    // --- 3) Fullscreen TAA -> backbuffer, только где stencil == 1 ---
+    // --- 3) Fullscreen TAA resolve ---
     {
-        auto dsv = DepthStencilView();
-        mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, &dsv);
-
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+
+        // PassCB
         auto passCB = mCurrFrameResource->PassCB->Resource();
         mCommandList->SetGraphicsRootConstantBufferView(1, passCB->GetGPUVirtualAddress());
 
-        mCommandList->SetPipelineState(mTaaPSOStencil.Get());
-        mCommandList->OMSetStencilRef(1);
-
-        // SRV t0..t2
+        // SRV t0..t2 = curr, history, depth
         mCommandList->SetGraphicsRootDescriptorTable(3, GetGpuSrv(mTaaHeapIndexStart));
 
+        if (mTaaViewMode == 4)
+        {
+            // Debug: только где stencil==1
+            auto dsv = DepthStencilView();
+            mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, &dsv);
+            mCommandList->SetPipelineState(mTaaPSOStencil.Get());
+            mCommandList->OMSetStencilRef(1);
+        }
+        else
+        {
+            // Обычный full-screen resolve: без DSV, без stencil
+            mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, nullptr);
+            mCommandList->SetPipelineState(mTaaPSO.Get());
+        }
+
+        // fullscreen triangle
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0);
     }
@@ -947,6 +967,7 @@ void SsaoApp::TaaResolvePass()
         mUseHistoryA = !mUseHistoryA;
     }
 }
+
 
 
 

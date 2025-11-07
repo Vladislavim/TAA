@@ -45,18 +45,19 @@ struct PassConstants
     DirectX::XMFLOAT2   InvRT = { 1.0f, 1.0f };
     float               TaaFeedback = 0.9f;
     float               TaaDepthThresh = 0.005f;
-    int                 TaaMode = 0;        // 0=Final,1=NoTAA,2=ShowHistory,3=ShowDiff,4=DebugSkull
-    int                 TaaEnabledInt = 1;  // 1=ON, 0=OFF
-    DirectX::XMFLOAT2   _taaPad = { 0,0 };
+    int                 TaaMode = 0; // 0=Final,1=NoTAA,2=ShowHistory,3=ShowDiff,4=DebugSkull
+    int                 TaaEnabledInt = 1; // 1=ON, 0=OFF
+    DirectX::XMFLOAT2   _taaPad = { 0, 0 };
     // TAA END
 
-    // === Debug skull (для подсветки/оверлея в TAA) ===
-    DirectX::XMFLOAT3   SkullCenterWS = { 0,0,0 };
+    // Debug skull (для оверлея в TAA)
+    DirectX::XMFLOAT3   SkullCenterWS = { 0, 0, 0 };
     float               SkullRadius = 0.0f;
-    DirectX::XMFLOAT4X4 InvSkullWorld = MathHelper::Identity4x4(); // world^-1 черепа (транспонированная для HLSL)
-    DirectX::XMFLOAT3   SkullExtentsLS = { 0,0,0 };  // половинные размеры локального AABB (опционально)
-    float               _skullPad = 0.0f;          // паддинг
+    DirectX::XMFLOAT4X4 InvSkullWorld = MathHelper::Identity4x4(); // TP(world^-1)
+    DirectX::XMFLOAT3   SkullExtentsLS = { 0, 0, 0 };
+    float               _skullPad = 0.0f; // паддинг
 };
+
 
 
 struct SsaoConstants
