@@ -444,7 +444,7 @@ void SsaoApp::Update(const GameTimer& gt)
     }
 
     // анимация skull (реальное движение)
-    AnimateSkull(gt);
+    //AnimateSkull(gt);
 
     AnimateMaterials(gt);
     UpdateObjectCBs(gt);
@@ -770,14 +770,14 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     XMMATRIX viewProjTex = XMMatrixMultiply(viewProj, T);
     XMMATRIX shadowTransform = XMLoadFloat4x4(&mShadowTransform);
 
-    // === NEW: держим предыдущую ViewProj (в том же TP-виде, как и другие матрицы в CB)
+    // === prev ViewProj для TAA ===
     static XMFLOAT4X4 sPrevViewProj = MathHelper::Identity4x4();
     if (!mHasPrevViewProj)
     {
-        XMStoreFloat4x4(&sPrevViewProj, XMMatrixTranspose(viewProj)); // на первом кадре prev = current
+        XMStoreFloat4x4(&sPrevViewProj, XMMatrixTranspose(viewProj)); // первый кадр: prev = current
         mHasPrevViewProj = true;
     }
-    mMainPassCB.PrevViewProj = sPrevViewProj; // положили прошлую в CB
+    mMainPassCB.PrevViewProj = sPrevViewProj;
 
     XMStoreFloat4x4(&mMainPassCB.View, XMMatrixTranspose(view));
     XMStoreFloat4x4(&mMainPassCB.InvView, XMMatrixTranspose(invView));
@@ -789,8 +789,19 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     XMStoreFloat4x4(&mMainPassCB.ShadowTransform, XMMatrixTranspose(shadowTransform));
 
     mMainPassCB.EyePosW = mCamera.GetPosition3f();
-    mMainPassCB.RenderTargetSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
-    mMainPassCB.InvRenderTargetSize = XMFLOAT2(1.0f / max(1, mClientWidth), 1.0f / max(1, mClientHeight));
+
+    // размер рендера
+    mMainPassCB.RenderTargetSize =
+        XMFLOAT2(static_cast<float>(mClientWidth), static_cast<float>(mClientHeight));
+
+    XMFLOAT2 invRT(
+        1.0f / max(1, mClientWidth),
+        1.0f / max(1, mClientHeight));
+
+    mMainPassCB.InvRenderTargetSize = invRT;
+    mMainPassCB.InvRT = invRT;   // TAA-специфичные копии
+    mMainPassCB.InvRT_dup = invRT;
+
     mMainPassCB.NearZ = 1.0f;
     mMainPassCB.FarZ = 1000.0f;
     mMainPassCB.TotalTime = gt.TotalTime();
@@ -803,35 +814,44 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     mMainPassCB.Lights[2].Direction = mRotatedLightDirections[2];
     mMainPassCB.Lights[2].Strength = { 0.0f, 0.0f, 0.0f };
 
-    // === TAA ===
+    // === TAA поля ===
     mMainPassCB.Jitter = gTaa.Jitter;
     mMainPassCB.PrevJitter = gTaa.PrevJitter;
-    mMainPassCB.InvRT = XMFLOAT2(1.0f / max(1, mClientWidth), 1.0f / max(1, mClientHeight));
+
     mMainPassCB.TaaMode = mTaaViewMode;
     mMainPassCB.TaaEnabledInt = mTaaEnabled ? 1 : 0;
-    mMainPassCB.TaaFeedback = MathHelper::Clamp(mMainPassCB.TaaFeedback, 0.0f, 0.99f);
+
+    // дефолт для feedback, если вдруг мусор
+    if (mMainPassCB.TaaFeedback <= 0.0f || mMainPassCB.TaaFeedback > 0.99f)
+        mMainPassCB.TaaFeedback = 0.9f;
+
+    mMainPassCB.TaaFeedback =
+        MathHelper::Clamp(mMainPassCB.TaaFeedback, 0.0f, 0.99f);
+
+    mMainPassCB.TaaDepthThresh = 0.001f;
 
     auto currPassCB = mCurrFrameResource->PassCB.get();
 
-    // === DEBUG-данные для skull (оставил как у тебя) ===
+    // === debug-данные для skull ===
     if (mSkullRitem)
     {
         const auto& skullSub = mGeometries["skullGeo"]->DrawArgs["skull"];
-        const DirectX::XMFLOAT3 cLS = skullSub.Bounds.Center;
-        const DirectX::XMFLOAT3 eLS = skullSub.Bounds.Extents;
+        const XMFLOAT3 cLS = skullSub.Bounds.Center;
+        const XMFLOAT3 eLS = skullSub.Bounds.Extents;
 
-        DirectX::XMMATRIX W = XMLoadFloat4x4(&mSkullRitem->World);
+        XMMATRIX W = XMLoadFloat4x4(&mSkullRitem->World);
 
-        DirectX::XMVECTOR cWSv = XMVector3TransformCoord(XMLoadFloat3(&cLS), W);
+        XMVECTOR cWSv = XMVector3TransformCoord(XMLoadFloat3(&cLS), W);
         XMStoreFloat3(&mMainPassCB.SkullCenterWS, cWSv);
 
         float sx = XMVectorGetX(XMVector3Length(W.r[0]));
         float sy = XMVectorGetX(XMVector3Length(W.r[1]));
         float sz = XMVectorGetX(XMVector3Length(W.r[2]));
-        DirectX::XMFLOAT3 eWS = { eLS.x * sx, eLS.y * sy, eLS.z * sz };
-        mMainPassCB.SkullRadius = std::sqrt(eWS.x * eWS.x + eWS.y * eWS.y + eWS.z * eWS.z);
+        XMFLOAT3 eWS = { eLS.x * sx, eLS.y * sy, eLS.z * sz };
+        mMainPassCB.SkullRadius =
+            std::sqrt(eWS.x * eWS.x + eWS.y * eWS.y + eWS.z * eWS.z);
 
-        DirectX::XMMATRIX invW = XMMatrixInverse(nullptr, W);
+        XMMATRIX invW = XMMatrixInverse(nullptr, W);
         XMStoreFloat4x4(&mMainPassCB.InvSkullWorld, XMMatrixTranspose(invW));
         mMainPassCB.SkullExtentsLS = eLS;
     }
@@ -845,9 +865,11 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
 
     currPassCB->CopyData(0, mMainPassCB);
 
-    // === готовим PrevViewProj на следующий кадр (в TP-виде) ===
+    // подготовка prev на следующий кадр
     XMStoreFloat4x4(&sPrevViewProj, XMMatrixTranspose(viewProj));
 }
+
+
 
 
 
