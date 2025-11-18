@@ -877,20 +877,58 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
 
 void SsaoApp::TaaResolvePass()
 {
-    // --- 0) первичная инициализация истории после ресайза/первого кадра ---
+    //
+    // 0) Первичная инициализация истории после ресайза / первого кадра
+    //    Делаем обе текстуры истории и копию текущего цвета валидными.
+    //
     if (!mTaaHistoryValid)
     {
-        auto histAct = (mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get());
-        InitOrRefreshTaaHistoryIfNeeded(
-            mCommandList.Get(),
-            CurrentBackBuffer(),
-            histAct,
-            mCurrColorCopy.Get(),
-            mBackBufferFormat);
-        mTaaHistoryValid = true;
+        auto src = CurrentBackBuffer();
+        auto histA = mTaaHistoryA.Get();
+        auto histB = mTaaHistoryB.Get();
+        auto currCopy = mCurrColorCopy.Get();
+
+        if (src && histA && histB && currCopy)
+        {
+            CD3DX12_RESOURCE_BARRIER preInit[] =
+            {
+                CD3DX12_RESOURCE_BARRIER::Transition(src,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(histA,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                CD3DX12_RESOURCE_BARRIER::Transition(histB,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+                CD3DX12_RESOURCE_BARRIER::Transition(currCopy,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            };
+            mCommandList->ResourceBarrier(_countof(preInit), preInit);
+
+            // Заполняем обе истории и копию текущим кадром
+            mCommandList->CopyResource(histA, src);
+            mCommandList->CopyResource(histB, src);
+            mCommandList->CopyResource(currCopy, src);
+
+            CD3DX12_RESOURCE_BARRIER postInit[] =
+            {
+                CD3DX12_RESOURCE_BARRIER::Transition(src,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                CD3DX12_RESOURCE_BARRIER::Transition(histA,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(histB,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(currCopy,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            };
+            mCommandList->ResourceBarrier(_countof(postInit), postInit);
+
+            mTaaHistoryValid = true;
+            mUseHistoryA = true; // пусть сначала читаем из A, пишем в B
+        }
     }
 
-    // --- 1) backbuffer -> mCurrColorCopy (форматы совпадают с backbuffer) ---
+    //
+    // 1) Копия текущего цвета: backbuffer -> mCurrColorCopy
+    //
     {
         auto src = CurrentBackBuffer();
         auto dst = mCurrColorCopy.Get();
@@ -898,35 +936,52 @@ void SsaoApp::TaaResolvePass()
         {
             CD3DX12_RESOURCE_BARRIER pre[] =
             {
-                CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+                CD3DX12_RESOURCE_BARRIER::Transition(src,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(dst,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
             };
             mCommandList->ResourceBarrier(_countof(pre), pre);
+
             mCommandList->CopyResource(dst, src);
+
             CD3DX12_RESOURCE_BARRIER post[] =
             {
-                CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
-                CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+                CD3DX12_RESOURCE_BARRIER::Transition(src,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                CD3DX12_RESOURCE_BARRIER::Transition(dst,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
             };
             mCommandList->ResourceBarrier(_countof(post), post);
         }
     }
 
-    // --- 2) t0..t2 = curr, history, depth ---
+    //
+    // 2) Выбор текстур истории для ping-pong:
+    //    histSrc — читаем, histDst — туда пишем resolved кадр.
+    //
+    ID3D12Resource* histSrc = mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get();
+    ID3D12Resource* histDst = mUseHistoryA ? mTaaHistoryB.Get() : mTaaHistoryA.Get();
+
+    //
+    // 3) Обновляем SRV t0..t2 = curr, history, depth
+    //
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Texture2D.MipLevels = 1;
         sd.Texture2D.MostDetailedMip = 0;
+        sd.Texture2D.ResourceMinLODClamp = 0.0f;
         sd.Format = ToNonSRGB(mBackBufferFormat); // SRV формат совместим с bb
 
-        // t0: curr
-        md3dDevice->CreateShaderResourceView(mCurrColorCopy.Get(), &sd, GetCpuSrv(mTaaHeapIndexStart + 0));
+        // t0: текущий цвет (копия backbuffer)
+        md3dDevice->CreateShaderResourceView(
+            mCurrColorCopy.Get(), &sd, GetCpuSrv(mTaaHeapIndexStart + 0));
 
-        // t1: history (активная)
-        auto histAct = (mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get());
-        md3dDevice->CreateShaderResourceView(histAct, &sd, GetCpuSrv(mTaaHeapIndexStart + 1));
+        // t1: история (источник)
+        md3dDevice->CreateShaderResourceView(
+            histSrc, &sd, GetCpuSrv(mTaaHeapIndexStart + 1));
 
         // t2: depth из SSAO-кучи (mSsaoHeapIndexStart+1)
         md3dDevice->CopyDescriptorsSimple(
@@ -936,59 +991,76 @@ void SsaoApp::TaaResolvePass()
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
-    // --- 3) Fullscreen TAA resolve ---
+    //
+    // 4) Fullscreen TAA resolve
+    //
     {
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 
         // PassCB
         auto passCB = mCurrFrameResource->PassCB->Resource();
-        mCommandList->SetGraphicsRootConstantBufferView(1, passCB->GetGPUVirtualAddress());
+        mCommandList->SetGraphicsRootConstantBufferView(
+            1, passCB->GetGPUVirtualAddress());
 
         // SRV t0..t2 = curr, history, depth
-        mCommandList->SetGraphicsRootDescriptorTable(3, GetGpuSrv(mTaaHeapIndexStart));
+        mCommandList->SetGraphicsRootDescriptorTable(
+            3, GetGpuSrv(mTaaHeapIndexStart));
 
         if (mTaaViewMode == 4)
         {
-            // Debug: только где stencil==1
+            // Debug: применять TAA только где stencil == 1
             auto dsv = DepthStencilView();
-            mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, &dsv);
+            mCommandList->OMSetRenderTargets(
+                1, &CurrentBackBufferView(), TRUE, &dsv);
             mCommandList->SetPipelineState(mTaaPSOStencil.Get());
             mCommandList->OMSetStencilRef(1);
         }
         else
         {
-            // Обычный full-screen resolve: без DSV, без stencil
-            mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, nullptr);
+            // Обычный full-screen resolve: без depth/stencil
+            mCommandList->OMSetRenderTargets(
+                1, &CurrentBackBufferView(), TRUE, nullptr);
             mCommandList->SetPipelineState(mTaaPSO.Get());
         }
 
         // fullscreen triangle
-        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mCommandList->IASetPrimitiveTopology(
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0);
     }
 
-    // --- 4) Обновляем историю (resolved backbuffer -> активная history) ---
+    //
+    // 5) Обновляем историю: resolved backbuffer -> histDst
+    //
     {
         auto src = CurrentBackBuffer();
-        auto dst = mUseHistoryA ? mTaaHistoryA.Get() : mTaaHistoryB.Get();
+        auto dst = histDst;
 
         CD3DX12_RESOURCE_BARRIER pre[] =
         {
-            CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+            CD3DX12_RESOURCE_BARRIER::Transition(src,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(dst,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
         };
         mCommandList->ResourceBarrier(_countof(pre), pre);
+
         mCommandList->CopyResource(dst, src);
+
         CD3DX12_RESOURCE_BARRIER post[] =
         {
-            CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
-            CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+            CD3DX12_RESOURCE_BARRIER::Transition(src,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(dst,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
         };
         mCommandList->ResourceBarrier(_countof(post), post);
-
-        mUseHistoryA = !mUseHistoryA;
     }
+
+    // Меняем «активную» историю на следующий кадр
+    mUseHistoryA = !mUseHistoryA;
 }
+
 
 
 
