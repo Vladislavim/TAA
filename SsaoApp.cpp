@@ -260,6 +260,8 @@ private:
     float mSkullMoveTime = 0.0f;
     bool mTaaHistoryValid = false;
     bool mHasPrevViewProj = false;
+    bool mShadowsEnabled = true;
+    int  mShadowMode = 0; // 0 = Luna PCF, 1 = м€гкие тени
 
 };
 
@@ -649,7 +651,8 @@ void SsaoApp::OnKeyboardInput(const GameTimer& gt)
     if (GetAsyncKeyState('K') & 0x1)  mTaaJitterPixels = max(0.0f, mTaaJitterPixels - 0.5f);
     if (GetAsyncKeyState('Y') & 0x1)
         mTaaViewMode = (mTaaViewMode + 1) % 5; // 0..4 (4=DebugSkull)
-
+    if (GetAsyncKeyState('H') & 0x1)
+        mShadowMode = 1 - mShadowMode;  // 0 <-> 1
     mCamera.UpdateViewMatrix();
 }
 
@@ -806,13 +809,14 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     mMainPassCB.FarZ = 1000.0f;
     mMainPassCB.TotalTime = gt.TotalTime();
     mMainPassCB.DeltaTime = gt.DeltaTime();
-    mMainPassCB.AmbientLight = { 0.4f, 0.4f, 0.6f, 1.0f };
+    mMainPassCB.AmbientLight = { 0.7f, 0.7f, 0.7f, 1.0f }; // чуть €рче, на вкус
     mMainPassCB.Lights[0].Direction = mRotatedLightDirections[0];
-    mMainPassCB.Lights[0].Strength = { 0.4f, 0.4f, 0.5f };
+    mMainPassCB.Lights[0].Strength = { 1.0f, 1.0f, 1.0f };
     mMainPassCB.Lights[1].Direction = mRotatedLightDirections[1];
-    mMainPassCB.Lights[1].Strength = { 0.1f, 0.1f, 0.1f };
+    mMainPassCB.Lights[1].Strength = { 0.0f, 0.0f, 0.0f };
     mMainPassCB.Lights[2].Direction = mRotatedLightDirections[2];
     mMainPassCB.Lights[2].Strength = { 0.0f, 0.0f, 0.0f };
+
 
     // === TAA пол€ ===
     mMainPassCB.Jitter = gTaa.Jitter;
@@ -829,6 +833,8 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
         MathHelper::Clamp(mMainPassCB.TaaFeedback, 0.0f, 0.99f);
 
     mMainPassCB.TaaDepthThresh = 0.001f;
+    // Ќќ¬ќ≈: режим теней в constant buffer
+    mMainPassCB.ShadowMode = mShadowMode;
 
     auto currPassCB = mCurrFrameResource->PassCB.get();
 
@@ -2228,9 +2234,11 @@ void SsaoApp::DrawNormalsAndDepth()
     const float clearValue[] = { 0.0f, 0.0f, 1.0f, 0.0f };
     mCommandList->ClearRenderTargetView(normalMapRtv, clearValue, 0, nullptr);
 
-    // „истим DEPTH|STENCIL тут. ¬ main-pass depth Ќ≈ трогаем.
-    mCommandList->ClearDepthStencilView(DepthStencilView(),
-        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+    // „истим DEPTH|STENCIL тут
+    mCommandList->ClearDepthStencilView(
+        DepthStencilView(),
+        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+        1.0f, 0, 0, nullptr);
 
     mCommandList->OMSetRenderTargets(1, &normalMapRtv, TRUE, &DepthStencilView());
 
@@ -2239,13 +2247,12 @@ void SsaoApp::DrawNormalsAndDepth()
 
     mCommandList->SetPipelineState(mPSOs["drawNormals"].Get());
 
-    // --- “ќЋ№ ќ SKULL ---
-    if (mSkullRitem)
-    {
-        UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
-        auto objectCB = mCurrFrameResource->ObjectCB->Resource();
-        auto* ri = mSkullRitem;
+    // –исуем все opaque (у нас это плейн + череп)
+    UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+    auto objectCB = mCurrFrameResource->ObjectCB->Resource();
 
+    for (auto* ri : mRitemLayer[(int)RenderLayer::Opaque])
+    {
         mCommandList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
         mCommandList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
         mCommandList->IASetPrimitiveTopology(ri->PrimitiveType);
@@ -2254,12 +2261,14 @@ void SsaoApp::DrawNormalsAndDepth()
             objectCB->GetGPUVirtualAddress() + ri->ObjCBIndex * objCBByteSize;
         mCommandList->SetGraphicsRootConstantBufferView(0, objCBAddress);
 
-        mCommandList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
+        mCommandList->DrawIndexedInstanced(
+            ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
     }
 
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
         normalMap, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_GENERIC_READ));
 }
+
 
 
 
