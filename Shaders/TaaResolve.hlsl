@@ -92,101 +92,104 @@ float4 PS_TAA(VSOut i) : SV_Target
 
     float4 curr = gCurr.SampleLevel(gsamLinearClamp, uv, 0);
 
-    // Если TAA выключен или вес истории 0 — сразу текущий кадр
-    if (gTaaEnabledInt == 0 || gTaaFeedback <= 0.0f)
-        return curr;
+    // Значения по умолчанию
+    float4 hist     = curr;
+    float4 taaColor = curr;
 
-    // Глубина текущего кадра (0..1)
+    // Глубина текущего кадра (0..1). Если 0 — reprojection не делаем.
     float depth = gDepth.SampleLevel(gsamLinearClamp, uv, 0).r;
-    if (depth == 0.0f)
-        return curr;
-
-    // 1) screen uv -> NDC
-    float4 posNdc = float4(uv * 2.0f - 1.0f, depth, 1.0f);
-
-    // 2) NDC -> world (через инвертированный ViewProj текущего кадра)
-    float4 posWorld = mul(posNdc, gInvViewProj);
-    posWorld /= posWorld.w;
-
-    // 3) world -> prev clip
-    float4 prevClip = mul(posWorld, gPrevViewProj);
-    if (prevClip.w <= 0.0f)
-        return curr;
-
-    float2 prevNdc = prevClip.xy / prevClip.w;
-    float2 prevUv  = prevNdc * 0.5f + 0.5f;
-
-    // Если ушли за экран прошлого кадра — история невалидна
-    if (prevUv.x < 0.0f || prevUv.x > 1.0f ||
-        prevUv.y < 0.0f || prevUv.y > 1.0f)
+    if (depth > 0.0f)
     {
-        return curr;
-    }
+        // 1) screen uv -> NDC
+        float4 posNdc = float4(uv * 2.0f - 1.0f, depth, 1.0f);
 
-    // 4) Выборка истории
-    float4 hist = gHistory.SampleLevel(gsamLinearClamp, prevUv, 0);
+        // 2) NDC -> world (через инвертированный ViewProj текущего кадра)
+        float4 posWorld = mul(posNdc, gInvViewProj);
+        posWorld /= posWorld.w;
 
-    // 5) Depth-проверка:
-    //    depth — текущая глубина (0..1),
-    //    prevClip.z/prevClip.w — прошлый NDC z в [-1..1] -> [0..1]
-    float depthCurr = depth;
-    float ndcPrevZ  = prevClip.z / prevClip.w;          // [-1..1]
-    float depthPrev = ndcPrevZ * 0.5f + 0.5f;           // [0..1]
+        // 3) world -> prev clip
+        float4 prevClip = mul(posWorld, gPrevViewProj);
 
-    float depthDiff = abs(depthCurr - depthPrev);
-    float reject    = step(gTaaDepthThresh, depthDiff); // 1 = отбрасываем историю
-
-    // === 6) Color clamping истории по локальному соседству current ===
-
-    // Размер texel’а (берём из gInvRT_TAA, можно и gInvRT)
-    float2 texel = gInvRT_TAA;
-
-    // Старт — текущий цвет
-    float3 cMin = curr.rgb;
-    float3 cMax = curr.rgb;
-
-    // Небольшое 3x3 окно вокруг uv в текущем кадре
-    [unroll]
-    for (int dy = -1; dy <= 1; ++dy)
-    {
-        [unroll]
-        for (int dx = -1; dx <= 1; ++dx)
+        if (prevClip.w > 0.0f)
         {
-            if (dx == 0 && dy == 0)
-                continue;
+            float2 prevNdc = prevClip.xy / prevClip.w;
+            float2 prevUv  = prevNdc * 0.5f + 0.5f;
 
-            float2 offs = float2(dx, dy) * texel;
-            float2 uvN  = uv + offs;
+            // Если ушли за экран прошлого кадра — историю не используем
+            if (all(prevUv >= 0.0f) && all(prevUv <= 1.0f))
+            {
+                // 4) Выборка истории
+                hist = gHistory.SampleLevel(gsamLinearClamp, prevUv, 0);
 
-            // Можно слегка обрезать по краям, чтобы не выходить за [0,1]
-            uvN = saturate(uvN);
+                // 5) Depth-проверка
+                float depthCurr = depth;
+                float ndcPrevZ  = prevClip.z / prevClip.w;   // [-1..1]
+                float depthPrev = ndcPrevZ * 0.5f + 0.5f;    // [0..1]
 
-            float3 c = gCurr.SampleLevel(gsamLinearClamp, uvN, 0).rgb;
-            cMin = min(cMin, c);
-            cMax = max(cMax, c);
+                float depthDiff = abs(depthCurr - depthPrev);
+                float reject    = step(gTaaDepthThresh, depthDiff); // 1 = отбрасываем историю
+
+                // === 6) Color clamping истории по локальному соседству current ===
+                float2 texel = gInvRT_TAA; // размер texel’а
+
+                float3 cMin = curr.rgb;
+                float3 cMax = curr.rgb;
+
+                [unroll]
+                for (int dy = -1; dy <= 1; ++dy)
+                {
+                    [unroll]
+                    for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        if (dx == 0 && dy == 0)
+                            continue;
+
+                        float2 uvN = saturate(uv + float2(dx, dy) * texel);
+                        float3 c   = gCurr.SampleLevel(gsamLinearClamp, uvN, 0).rgb;
+                        cMin = min(cMin, c);
+                        cMax = max(cMax, c);
+                    }
+                }
+
+                const float epsilon = 0.02f;
+                float3 clampMin = cMin - epsilon;
+                float3 clampMax = cMax + epsilon;
+                hist.rgb = clamp(hist.rgb, clampMin, clampMax);
+
+                // === 7) Смешивание истории и current ===
+                float feedback = saturate(gTaaFeedback);
+                float useHist  = (1.0f - reject) * feedback;
+
+                taaColor = lerp(curr, hist, useHist);
+            }
         }
     }
 
-    // Небольшой допуск, чтобы не резать слишком жёстко
-    const float epsilon = 0.02f;
-    float3 clampMin = cMin - epsilon;
-    float3 clampMax = cMax + epsilon;
+    // Если TAA выключен или вес истории 0 — просто игнорируем историю.
+    if (gTaaEnabledInt == 0 || gTaaFeedback <= 0.0f)
+    {
+        taaColor = curr;
+    }
 
-    // Клэмпим историю в этот диапазон
-    hist.rgb = clamp(hist.rgb, clampMin, clampMax);
+    // === Режимы просмотра по gTaaMode ===
+    // 0: TAA
+    // 1: только текущий кадр
+    // 2: только история (после reprojection + clamping)
+    // 3: разница
+    // 4: пока тоже TAA (можно сделать отдельный debug под череп)
 
-    // === 7) Смешивание истории и current ===
+    if (gTaaMode == 1)
+        return curr;
 
-    float feedback = saturate(gTaaFeedback);
-    float useHist  = (1.0 - reject) * feedback;
+    if (gTaaMode == 2)
+        return hist;
 
-    float4 taa = lerp(curr, hist, useHist);
+    if (gTaaMode == 3)
+    {
+        float3 diff = abs(curr.rgb - hist.rgb) * 4.0f; // усиливаем для видимости
+        return float4(diff, 1.0f);
+    }
 
-    // Режимы просмотра
-    if (gTaaMode == 1) return curr;             // Current
-    if (gTaaMode == 2) return hist;             // History (уже с clamping)
-    if (gTaaMode == 3) return abs(curr - hist); // Diff
-    // gTaaMode == 4 — debug по stencil, делается в C++
-
-    return taa;
+    // gTaaMode == 0 или 4
+    return taaColor;
 }

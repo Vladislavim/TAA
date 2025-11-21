@@ -269,6 +269,7 @@ private:
     float mAtmosphereHeightFalloff = 0.06f;  // туман тянется выше
     float mAtmosphereCleanliness = 0.35f;  // стартуем с лёгкого смога
     float mAtmosphereIntensity = 2.0f;   // эффект заметнее
+    bool mWireframeEnabled = false;
 };
 
 
@@ -476,7 +477,7 @@ void SsaoApp::UpdateDebugWindowTitle(const GameTimer& gt)
     oss << std::fixed << std::setprecision(2);
 
     // TAA: ON/OFF + режим
-    oss << L"TAA: " << (mTaaEnabled ? L"ON" : L"OFF");
+    oss << L"TAA: " << (mTaaEnabled ? L"OFF" : L"ON");
     oss << L"  |  Mode: " << mTaaViewMode;
     oss << L"  |  Feedback: " << mMainPassCB.TaaFeedback;
     oss << L"  |  JitterPx: " << mTaaJitterPixels;
@@ -561,7 +562,9 @@ void SsaoApp::Draw(const GameTimer& gt)
     mCommandList->SetGraphicsRootDescriptorTable(3, skyTexDescriptor);
 
     // --- Все opaque КРОМЕ skull: рисуем по pre-pass глубине (DepthFunc = EQUAL) ---
-    mCommandList->SetPipelineState(mPSOs["opaque"].Get());
+    mCommandList->SetPipelineState(
+        mWireframeEnabled ? mPSOs["opaque_wireframe"].Get()
+        : mPSOs["opaque"].Get());
     {
         UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
         auto objectCB = mCurrFrameResource->ObjectCB->Resource();
@@ -691,6 +694,8 @@ void SsaoApp::OnKeyboardInput(const GameTimer& gt)
 
     if (GetAsyncKeyState('X') & 0x8000)
         mAtmosphereCleanliness = max(0.0f, mAtmosphereCleanliness - 0.5f * dt);
+    if (GetAsyncKeyState('G') & 0x1)
+        mWireframeEnabled = !mWireframeEnabled;
     mCamera.UpdateViewMatrix();
 }
 
@@ -870,7 +875,7 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     mMainPassCB.TaaFeedback =
         MathHelper::Clamp(mMainPassCB.TaaFeedback, 0.0f, 0.99f);
 
-    mMainPassCB.TaaDepthThresh = 0.001f;
+    mMainPassCB.TaaDepthThresh = 0.01f;
     // НОВОЕ: режим теней в constant buffer
     mMainPassCB.ShadowMode = mShadowMode;
     // === НОВОЕ: атмосфера ===
@@ -1037,47 +1042,34 @@ void SsaoApp::TaaResolvePass()
         md3dDevice->CopyDescriptorsSimple(
             1,
             GetCpuSrv(mTaaHeapIndexStart + 2),
-            GetCpuSrv(mSsaoHeapIndexStart + 1),
+            GetCpuSrv(mSsaoHeapIndexStart + 2),
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
     //
     // 4) Fullscreen TAA resolve
     //
+    // 4) Fullscreen TAA resolve
     {
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 
-        // PassCB
         auto passCB = mCurrFrameResource->PassCB->Resource();
         mCommandList->SetGraphicsRootConstantBufferView(
             1, passCB->GetGPUVirtualAddress());
 
-        // SRV t0..t2 = curr, history, depth
+        // t0..t2 = curr, history, depth
         mCommandList->SetGraphicsRootDescriptorTable(
             3, GetGpuSrv(mTaaHeapIndexStart));
 
-        if (mTaaViewMode == 4)
-        {
-            // Debug: применять TAA только где stencil == 1
-            auto dsv = DepthStencilView();
-            mCommandList->OMSetRenderTargets(
-                1, &CurrentBackBufferView(), TRUE, &dsv);
-            mCommandList->SetPipelineState(mTaaPSOStencil.Get());
-            mCommandList->OMSetStencilRef(1);
-        }
-        else
-        {
-            // Обычный full-screen resolve: без depth/stencil
-            mCommandList->OMSetRenderTargets(
-                1, &CurrentBackBufferView(), TRUE, nullptr);
-            mCommandList->SetPipelineState(mTaaPSO.Get());
-        }
+        // Всегда полноэкранный resolve по всему backbuffer’у
+        mCommandList->OMSetRenderTargets(
+            1, &CurrentBackBufferView(), TRUE, nullptr);
+        mCommandList->SetPipelineState(mTaaPSO.Get());
 
-        // fullscreen triangle
-        mCommandList->IASetPrimitiveTopology(
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0);
     }
+
 
     //
     // 5) Обновляем историю: resolved backbuffer -> histDst
@@ -1781,6 +1773,15 @@ void SsaoApp::BuildPSOs()
     opaquePsoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
     opaquePsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaquePsoDesc, IID_PPV_ARGS(&mPSOs["opaque"])));
+
+    // wireframe вариант для основных объектов
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC opaqueWireframeDesc = opaquePsoDesc;
+    opaqueWireframeDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    opaqueWireframeDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // чтобы видеть обе стороны
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &opaqueWireframeDesc, IID_PPV_ARGS(&mPSOs["opaque_wireframe"])));
+
+
 
     // shadow
     D3D12_GRAPHICS_PIPELINE_STATE_DESC smapPsoDesc = basePsoDesc;
