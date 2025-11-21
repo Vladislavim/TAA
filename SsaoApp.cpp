@@ -267,7 +267,7 @@ private:
     int  mShadowMode = 0; // 0 = Luna PCF, 1 = м€гкие тени
     float mAtmosphereGlobalDensity = 0.035f; // было 0.02
     float mAtmosphereHeightFalloff = 0.06f;  // туман т€нетс€ выше
-    float mAtmosphereCleanliness = 0.35f;  // стартуем с лЄгкого смога
+    float mAtmosphereCleanliness = 0.5f;  // стартуем с лЄгкого смога
     float mAtmosphereIntensity = 2.0f;   // эффект заметнее
     bool mWireframeEnabled = false;
 };
