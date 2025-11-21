@@ -109,6 +109,11 @@ cbuffer cbPass : register(b1)
     // === НОВОЕ: режим теней ===
     int      gShadowMode;   // 0 = Luna, 1 = soft
     float3   gShadowPad;
+// === НОВОЕ: атмосфера ===
+    float gAtmosphereGlobalDensity;
+    float gAtmosphereHeightFalloff;
+    float gAtmosphereCleanliness;
+    float gAtmosphereIntensity;
 };
 
 

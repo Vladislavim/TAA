@@ -11,6 +11,8 @@
 #include "ShadowMap.h"
 #include "Ssao.h"
 #include <algorithm>
+#include <sstream>
+#include <iomanip>
 
 // ------------------------------------------------------------
 // Конвертирует SRGB формат в обычный UNORM
@@ -174,6 +176,7 @@ private:
 
     void CreateTaaResources();
     void AnimateSkull(const GameTimer& gt);
+    void UpdateDebugWindowTitle(const GameTimer& gt);
 private:
 
     std::vector<std::unique_ptr<FrameResource>> mFrameResources;
@@ -262,7 +265,10 @@ private:
     bool mHasPrevViewProj = false;
     bool mShadowsEnabled = true;
     int  mShadowMode = 0; // 0 = Luna PCF, 1 = мягкие тени
-
+    float mAtmosphereGlobalDensity = 0.035f; // было 0.02
+    float mAtmosphereHeightFalloff = 0.06f;  // туман тянется выше
+    float mAtmosphereCleanliness = 0.35f;  // стартуем с лёгкого смога
+    float mAtmosphereIntensity = 2.0f;   // эффект заметнее
 };
 
 
@@ -460,9 +466,35 @@ void SsaoApp::Update(const GameTimer& gt)
     UpdateMainPassCB(gt);
     UpdateShadowPassCB(gt);
     UpdateSsaoCB(gt);
+    UpdateDebugWindowTitle(gt);
 }
 
 
+void SsaoApp::UpdateDebugWindowTitle(const GameTimer& gt)
+{
+    std::wostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+
+    // TAA: ON/OFF + режим
+    oss << L"TAA: " << (mTaaEnabled ? L"ON" : L"OFF");
+    oss << L"  |  Mode: " << mTaaViewMode;
+    oss << L"  |  Feedback: " << mMainPassCB.TaaFeedback;
+    oss << L"  |  JitterPx: " << mTaaJitterPixels;
+
+    // Атмосфера
+    oss << L"  ||  Atmosphere  Cleanliness: " << mAtmosphereCleanliness;
+    oss << L", Density: " << mAtmosphereGlobalDensity;
+    oss << L", Intensity: " << mAtmosphereIntensity;
+
+    // Тени
+    oss << L"  ||  Shadows: "
+        << (mShadowMode == 0 ? L"Luna PCF" : L"Soft pseudo RT");
+
+    // Подсказка по кнопкам
+    oss << L"  ||  [T: TAA] [Y: TAA view] [H: shadows] [Z/X: atmosphere]";
+
+    SetWindowText(mhMainWnd, oss.str().c_str());
+}
 
 
 
@@ -653,6 +685,12 @@ void SsaoApp::OnKeyboardInput(const GameTimer& gt)
         mTaaViewMode = (mTaaViewMode + 1) % 5; // 0..4 (4=DebugSkull)
     if (GetAsyncKeyState('H') & 0x1)
         mShadowMode = 1 - mShadowMode;  // 0 <-> 1
+    // Чистота атмосферы: X = грязнее, Z = чище
+    if (GetAsyncKeyState('Z') & 0x8000)
+        mAtmosphereCleanliness = min(1.0f, mAtmosphereCleanliness + 0.5f * dt);
+
+    if (GetAsyncKeyState('X') & 0x8000)
+        mAtmosphereCleanliness = max(0.0f, mAtmosphereCleanliness - 0.5f * dt);
     mCamera.UpdateViewMatrix();
 }
 
@@ -835,6 +873,11 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     mMainPassCB.TaaDepthThresh = 0.001f;
     // НОВОЕ: режим теней в constant buffer
     mMainPassCB.ShadowMode = mShadowMode;
+    // === НОВОЕ: атмосфера ===
+    mMainPassCB.AtmosphereGlobalDensity = mAtmosphereGlobalDensity;
+    mMainPassCB.AtmosphereHeightFalloff = mAtmosphereHeightFalloff;
+    mMainPassCB.AtmosphereCleanliness = mAtmosphereCleanliness;
+    mMainPassCB.AtmosphereIntensity = mAtmosphereIntensity;
 
     auto currPassCB = mCurrFrameResource->PassCB.get();
 
@@ -868,6 +911,7 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
         XMStoreFloat4x4(&mMainPassCB.InvSkullWorld, XMMatrixIdentity());
         mMainPassCB.SkullExtentsLS = { 0,0,0 };
     }
+
 
     currPassCB->CopyData(0, mMainPassCB);
 

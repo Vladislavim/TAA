@@ -65,6 +65,13 @@ struct PassConstants
     // === НОВОЕ: режим теней ===
     int                 ShadowMode = 0;           // 0 = Luna, 1 = мягкий
     DirectX::XMFLOAT3   ShadowPad = { 0.0f, 0.0f, 0.0f };
+
+    // === НОВОЕ: атмосфера (Exponential Height Fog) ===
+    float               AtmosphereGlobalDensity = 0.02f; // базовая плотность
+    float               AtmosphereHeightFalloff = 0.1f;  // спад плотности с высотой
+    float               AtmosphereCleanliness = 0.5f;  // 0 = грязно, 1 = чисто
+    float               AtmosphereIntensity = 1.0f;  // масштаб эффекта
+
 };
 
 
