@@ -1201,7 +1201,7 @@ void SsaoApp::LoadTextures()
         L"../../Textures/tile_nmap.dds",
         L"../../Textures/white1x1.dds",
         L"../../Textures/default_nmap.dds",
-        L"../../Textures/sunsetcube1024.dds"
+        L"../../Textures/Cubemap_Sky_04-512x512.dds"
     };
 
     for (int i = 0; i < (int)texNames.size(); ++i)
