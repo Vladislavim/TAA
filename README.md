@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/Vladislavim/TAA/blob/master/изображение_2025-11-24_145457267.png" alt="TAA + Pseudo RT + Procedural Fog demo" width="900">
+  <img src="https://github.com/Vladislavim/TAA/blob/master/изображение_2025-11-24_145631227.png" alt="TAA + Pseudo RT + Procedural Fog demo" width="900">
 </p>
 
 # TAA + Pseudo RT Shadows + Procedural Fog (D3D12)
