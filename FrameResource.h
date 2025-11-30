@@ -71,7 +71,11 @@ struct PassConstants
     float               AtmosphereHeightFalloff = 0.1f;  // спад плотности с высотой
     float               AtmosphereCleanliness = 0.5f;  // 0 = грязно, 1 = чисто
     float               AtmosphereIntensity = 1.0f;  // масштаб эффекта
-
+    // ==== Outline-параметры ====
+    float OutlineDepthThreshold; // порог по depth
+    float OutlineStrength;       // 0..1
+    DirectX::XMFLOAT3 OutlineColor; // RGB
+    float padOutline;            // для выравнивания (чтобы cb был кратен 16 байт)
 };
 
 

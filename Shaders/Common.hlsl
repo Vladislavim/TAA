@@ -114,6 +114,11 @@ cbuffer cbPass : register(b1)
     float gAtmosphereHeightFalloff;
     float gAtmosphereCleanliness;
     float gAtmosphereIntensity;
+ // === Outline params ===
+    float gOutlineDepthThreshold;
+    float gOutlineStrength;
+    float3 gOutlineColor;
+    float  gOutlinePad;
 };
 
 

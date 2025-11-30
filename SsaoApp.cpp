@@ -453,7 +453,7 @@ void SsaoApp::Update(const GameTimer& gt)
     }
 
     // анимация skull (реальное движение)
-    //AnimateSkull(gt);
+    AnimateSkull(gt);
 
     AnimateMaterials(gt);
     UpdateObjectCBs(gt);
@@ -522,7 +522,7 @@ void SsaoApp::Draw(const GameTimer& gt)
     //
     // Normal/depth pre-pass.
     //
-    DrawNormalsAndDepth(); // тут мы уже чистим ТОЛЬКО stencil, depth сохраняем
+    DrawNormalsAndDepth();
 
     //
     // SSAO.
@@ -540,18 +540,13 @@ void SsaoApp::Draw(const GameTimer& gt)
     mCommandList->RSSetViewports(1, &mScreenViewport);
     mCommandList->RSSetScissorRects(1, &mScissorRect);
 
-    // backbuffer: PRESENT -> RENDER_TARGET
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
         CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
 
-    // clear color. ВАЖНО: depth здесь НЕ чистим!
     mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::LightSteelBlue, 0, nullptr);
-    // НЕ вызывать ClearDepthStencilView с флагом DEPTH в main-pass.
-    // Глубина из pre-pass должна сохраниться для теста EQUAL.
 
     mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
 
-    // таблица текстур сцены
     mCommandList->SetGraphicsRootDescriptorTable(4, mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
 
     auto passCB = mCurrFrameResource->PassCB->Resource();
@@ -580,16 +575,14 @@ void SsaoApp::Draw(const GameTimer& gt)
                 objectCB->GetGPUVirtualAddress() + ri->ObjCBIndex * objCBByteSize;
 
             mCommandList->SetGraphicsRootConstantBufferView(0, objCBAddress);
-            mCommandList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
+            mCommandList->DrawIndexedInstanced(
+                ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
         }
     }
 
-    // --- skull: рисуем c записью stencil = 1, depth не пишем (оставляем как есть) ---
-    // --- OPAQUE: НЕ рисуем ничего, КРОМЕ skull ---
+    // --- skull: обычный цвет + запись stencil = 1 ---
     if (mSkullRitem)
     {
-        // Сначала обычный цвет для skull? Вы у себя рисуете skull в PSO с записью stencil.
-        // Этого достаточно (цвет+стенсил), depth не пишем — используем pre-pass.
         mCommandList->SetPipelineState(mPSOs["opaque_stencilWrite"].Get());
         mCommandList->OMSetStencilRef(1);
 
@@ -605,11 +598,32 @@ void SsaoApp::Draw(const GameTimer& gt)
             objectCB->GetGPUVirtualAddress() + ri->ObjCBIndex * objCBByteSize;
         mCommandList->SetGraphicsRootConstantBufferView(0, objCBAddress);
 
-        mCommandList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
+        mCommandList->DrawIndexedInstanced(
+            ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
     }
 
+    // --- ЧЕРНЫЙ КОНТУР ВОКРУГ ЧЕРЕПА ---
+    if (mSkullRitem)
+    {
+        mCommandList->SetPipelineState(mPSOs["skull_outline"].Get());
 
-    // sky (DepthFunc = LESS_EQUAL) — теперь не перекроет уже отрисованные объекты
+        UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+        auto objectCB = mCurrFrameResource->ObjectCB->Resource();
+        auto* ri = mSkullRitem;
+
+        mCommandList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
+        mCommandList->IASetIndexBuffer(&ri->Geo->IndexBufferView());
+        mCommandList->IASetPrimitiveTopology(ri->PrimitiveType);
+
+        D3D12_GPU_VIRTUAL_ADDRESS objCBAddress =
+            objectCB->GetGPUVirtualAddress() + ri->ObjCBIndex * objCBByteSize;
+        mCommandList->SetGraphicsRootConstantBufferView(0, objCBAddress);
+
+        mCommandList->DrawIndexedInstanced(
+            ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
+    }
+
+    // sky
     mCommandList->SetPipelineState(mPSOs["sky"].Get());
     DrawRenderItems(mCommandList.Get(), mRitemLayer[(int)RenderLayer::Sky]);
 
@@ -619,7 +633,6 @@ void SsaoApp::Draw(const GameTimer& gt)
     if (mTaaEnabled)
         TaaResolvePass();
 
-    // backbuffer: RENDER_TARGET -> PRESENT
     mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
         CurrentBackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
 
@@ -633,6 +646,7 @@ void SsaoApp::Draw(const GameTimer& gt)
     mCurrFrameResource->Fence = ++mCurrentFence;
     mCommandQueue->Signal(mFence.Get(), mCurrentFence);
 }
+
 
 
 
@@ -884,6 +898,13 @@ void SsaoApp::UpdateMainPassCB(const GameTimer& gt)
     mMainPassCB.AtmosphereCleanliness = mAtmosphereCleanliness;
     mMainPassCB.AtmosphereIntensity = mAtmosphereIntensity;
 
+    mMainPassCB.OutlineDepthThreshold = 0.2f;          // порог "силуэта"
+    mMainPassCB.OutlineStrength = 0.9f;          // сила контура
+    mMainPassCB.OutlineColor = XMFLOAT3(1.0f, 0.0f, 0.0f); // чёрный
+    mMainPassCB.padOutline = 0.0f;
+
+
+
     auto currPassCB = mCurrFrameResource->PassCB.get();
 
     // === debug-данные для skull ===
@@ -1046,10 +1067,7 @@ void SsaoApp::TaaResolvePass()
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
-    //
-    // 4) Fullscreen TAA resolve
-    //
-    // 4) Fullscreen TAA resolve
+    // 4) Fullscreen TAA resolve ТОЛЬКО по stencil == 1 (skull)
     {
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 
@@ -1061,14 +1079,21 @@ void SsaoApp::TaaResolvePass()
         mCommandList->SetGraphicsRootDescriptorTable(
             3, GetGpuSrv(mTaaHeapIndexStart));
 
-        // Всегда полноэкранный resolve по всему backbuffer’у
-        mCommandList->OMSetRenderTargets(
-            1, &CurrentBackBufferView(), TRUE, nullptr);
-        mCommandList->SetPipelineState(mTaaPSO.Get());
+        // Привязываем и RTV, и DSV (нужен stencil)
+        auto rtv = CurrentBackBufferView();
+        auto dsv = DepthStencilView();
+        mCommandList->OMSetRenderTargets(1, &rtv, TRUE, &dsv);
+
+        // Используем PSO со stencil-тестом EQUAL 1
+        mCommandList->SetPipelineState(mTaaPSOStencil.Get());
+
+        // ВАЖНО: ref = 1, потому что skull писал stencil = 1
+        mCommandList->OMSetStencilRef(1);
 
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0);
     }
+
 
 
     //
@@ -1453,6 +1478,12 @@ void SsaoApp::BuildShadersAndInputLayout()
     mShaders["standardVS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "PS", "ps_5_1");
 
+    // --- НОВОЕ: шейдеры для контура черепа ---
+    mShaders["skullOutlineVS"] = d3dUtil::CompileShader(
+        L"Shaders\\Default.hlsl", nullptr, "VS_SkullOutline", "vs_5_1");
+    mShaders["skullOutlinePS"] = d3dUtil::CompileShader(
+        L"Shaders\\Default.hlsl", nullptr, "PS_SkullOutline", "ps_5_1");
+
     mShaders["shadowVS"] = d3dUtil::CompileShader(L"Shaders\\Shadows.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["shadowOpaquePS"] = d3dUtil::CompileShader(L"Shaders\\Shadows.hlsl", nullptr, "PS", "ps_5_1");
     mShaders["shadowAlphaTestedPS"] = d3dUtil::CompileShader(L"Shaders\\Shadows.hlsl", alphaTestDefines, "PS", "ps_5_1");
@@ -1465,14 +1496,13 @@ void SsaoApp::BuildShadersAndInputLayout()
 
     mShaders["ssaoVS"] = d3dUtil::CompileShader(L"Shaders\\Ssao.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["ssaoPS"] = d3dUtil::CompileShader(L"Shaders\\Ssao.hlsl", nullptr, "PS", "ps_5_1");
-
     mShaders["ssaoBlurVS"] = d3dUtil::CompileShader(L"Shaders\\SsaoBlur.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["ssaoBlurPS"] = d3dUtil::CompileShader(L"Shaders\\SsaoBlur.hlsl", nullptr, "PS", "ps_5_1");
 
     mShaders["skyVS"] = d3dUtil::CompileShader(L"Shaders\\Sky.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["skyPS"] = d3dUtil::CompileShader(L"Shaders\\Sky.hlsl", nullptr, "PS", "ps_5_1");
 
-    // === TAA: ????????????? VS/PS ===
+    // === TAA: resolve VS/PS ===
     mTaaVS = d3dUtil::CompileShader(L"Shaders\\TaaResolve.hlsl", nullptr, "VS_FullscreenTriangle", "vs_5_1");
     mTaaPS = d3dUtil::CompileShader(L"Shaders\\TaaResolve.hlsl", nullptr, "PS_TAA", "ps_5_1");
 
@@ -1484,6 +1514,7 @@ void SsaoApp::BuildShadersAndInputLayout()
         { "TANGENT",  0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
 }
+
 
 
 void SsaoApp::BuildShapeGeometry()
@@ -1772,16 +1803,34 @@ void SsaoApp::BuildPSOs()
     D3D12_GRAPHICS_PIPELINE_STATE_DESC opaquePsoDesc = basePsoDesc;
     opaquePsoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
     opaquePsoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&opaquePsoDesc, IID_PPV_ARGS(&mPSOs["opaque"])));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &opaquePsoDesc, IID_PPV_ARGS(&mPSOs["opaque"])));
 
     // wireframe вариант для основных объектов
     D3D12_GRAPHICS_PIPELINE_STATE_DESC opaqueWireframeDesc = opaquePsoDesc;
     opaqueWireframeDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
-    opaqueWireframeDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // чтобы видеть обе стороны
+    opaqueWireframeDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
         &opaqueWireframeDesc, IID_PPV_ARGS(&mPSOs["opaque_wireframe"])));
 
+    // === НОВОЕ: PSO для чёрного контура черепа ===
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC skullOutlineDesc = basePsoDesc;
+    skullOutlineDesc.VS =
+    { reinterpret_cast<BYTE*>(mShaders["skullOutlineVS"]->GetBufferPointer()),
+      mShaders["skullOutlineVS"]->GetBufferSize() };
+    skullOutlineDesc.PS =
+    { reinterpret_cast<BYTE*>(mShaders["skullOutlinePS"]->GetBufferPointer()),
+      mShaders["skullOutlinePS"]->GetBufferSize() };
 
+    // рисуем задние грани раздутого меша
+    skullOutlineDesc.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+
+    // обычный depth-тест, запись глубины можно включить или выключить — не критично
+    skullOutlineDesc.DepthStencilState.DepthEnable = TRUE;
+    skullOutlineDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &skullOutlineDesc, IID_PPV_ARGS(&mPSOs["skull_outline"])));
 
     // shadow
     D3D12_GRAPHICS_PIPELINE_STATE_DESC smapPsoDesc = basePsoDesc;
@@ -1797,7 +1846,8 @@ void SsaoApp::BuildPSOs()
       mShaders["shadowOpaquePS"]->GetBufferSize() };
     smapPsoDesc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
     smapPsoDesc.NumRenderTargets = 0;
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&smapPsoDesc, IID_PPV_ARGS(&mPSOs["shadow_opaque"])));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &smapPsoDesc, IID_PPV_ARGS(&mPSOs["shadow_opaque"])));
 
     // debug
     D3D12_GRAPHICS_PIPELINE_STATE_DESC debugPsoDesc = basePsoDesc;
@@ -1808,7 +1858,8 @@ void SsaoApp::BuildPSOs()
     debugPsoDesc.PS =
     { reinterpret_cast<BYTE*>(mShaders["debugPS"]->GetBufferPointer()),
       mShaders["debugPS"]->GetBufferSize() };
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&debugPsoDesc, IID_PPV_ARGS(&mPSOs["debug"])));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &debugPsoDesc, IID_PPV_ARGS(&mPSOs["debug"])));
 
     // drawNormals (pre-pass в нормали + depth)
     D3D12_GRAPHICS_PIPELINE_STATE_DESC drawNormalsPsoDesc = basePsoDesc;
@@ -1822,7 +1873,8 @@ void SsaoApp::BuildPSOs()
     drawNormalsPsoDesc.SampleDesc.Count = 1;
     drawNormalsPsoDesc.SampleDesc.Quality = 0;
     drawNormalsPsoDesc.DSVFormat = mDepthStencilFormat;
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&drawNormalsPsoDesc, IID_PPV_ARGS(&mPSOs["drawNormals"])));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &drawNormalsPsoDesc, IID_PPV_ARGS(&mPSOs["drawNormals"])));
 
     // ssao
     D3D12_GRAPHICS_PIPELINE_STATE_DESC ssaoPsoDesc = basePsoDesc;
@@ -1840,7 +1892,8 @@ void SsaoApp::BuildPSOs()
     ssaoPsoDesc.SampleDesc.Count = 1;
     ssaoPsoDesc.SampleDesc.Quality = 0;
     ssaoPsoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&ssaoPsoDesc, IID_PPV_ARGS(&mPSOs["ssao"])));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &ssaoPsoDesc, IID_PPV_ARGS(&mPSOs["ssao"])));
 
     // ssao blur
     D3D12_GRAPHICS_PIPELINE_STATE_DESC ssaoBlurPsoDesc = ssaoPsoDesc;
@@ -1850,7 +1903,8 @@ void SsaoApp::BuildPSOs()
     ssaoBlurPsoDesc.PS =
     { reinterpret_cast<BYTE*>(mShaders["ssaoBlurPS"]->GetBufferPointer()),
       mShaders["ssaoBlurPS"]->GetBufferSize() };
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&ssaoBlurPsoDesc, IID_PPV_ARGS(&mPSOs["ssaoBlur"])));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &ssaoBlurPsoDesc, IID_PPV_ARGS(&mPSOs["ssaoBlur"])));
 
     // sky
     D3D12_GRAPHICS_PIPELINE_STATE_DESC skyPsoDesc = basePsoDesc;
@@ -1863,9 +1917,10 @@ void SsaoApp::BuildPSOs()
     skyPsoDesc.PS =
     { reinterpret_cast<BYTE*>(mShaders["skyPS"]->GetBufferPointer()),
       mShaders["skyPS"]->GetBufferSize() };
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&skyPsoDesc, IID_PPV_ARGS(&mPSOs["sky"])));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &skyPsoDesc, IID_PPV_ARGS(&mPSOs["sky"])));
 
-    // TAA resolve (fullscreen, без depth/stencil)
+    // TAA resolve (fullscreen)
     D3D12_GRAPHICS_PIPELINE_STATE_DESC taaPsoDesc = {};
     taaPsoDesc.pRootSignature = mRootSignature.Get();
     taaPsoDesc.VS = { reinterpret_cast<BYTE*>(mTaaVS->GetBufferPointer()), mTaaVS->GetBufferSize() };
@@ -1880,17 +1935,14 @@ void SsaoApp::BuildPSOs()
     taaPsoDesc.RTVFormats[0] = mBackBufferFormat;
     taaPsoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
     taaPsoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&taaPsoDesc, IID_PPV_ARGS(&mTaaPSO)));
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+        &taaPsoDesc, IID_PPV_ARGS(&mTaaPSO)));
 
-    // === Opaque со записью stencil = 1 (только для skull). ВАЖНО: DepthFunc = LESS_EQUAL, запись Z отключена ===
+    // === Opaque со записью stencil = 1 (только для skull) ===
     D3D12_GRAPHICS_PIPELINE_STATE_DESC opaqueStencilWrite = basePsoDesc;
-
-    // читаем Z, но не пишем его
     opaqueStencilWrite.DepthStencilState.DepthEnable = TRUE;
     opaqueStencilWrite.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     opaqueStencilWrite.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-
-    // запись в stencil = 1
     opaqueStencilWrite.DepthStencilState.StencilEnable = TRUE;
     opaqueStencilWrite.DepthStencilState.StencilWriteMask = 0xFF;
     opaqueStencilWrite.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
@@ -1910,7 +1962,7 @@ void SsaoApp::BuildPSOs()
     taaStencil.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     taaStencil.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
     taaStencil.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-    taaStencil.DepthStencilState.DepthEnable = FALSE;       // resolve без глубины
+    taaStencil.DepthStencilState.DepthEnable = FALSE;
     taaStencil.DepthStencilState.StencilEnable = TRUE;
     taaStencil.DepthStencilState.StencilReadMask = 0xFF;
     taaStencil.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
@@ -1922,12 +1974,13 @@ void SsaoApp::BuildPSOs()
     taaStencil.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     taaStencil.NumRenderTargets = 1;
     taaStencil.RTVFormats[0] = mBackBufferFormat;
-    taaStencil.DSVFormat = mDepthStencilFormat; // нужен DSV для stencil-теста
+    taaStencil.DSVFormat = mDepthStencilFormat;
     taaStencil.SampleDesc.Count = m4xMsaaState ? 4 : 1;
     taaStencil.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
         &taaStencil, IID_PPV_ARGS(&mTaaPSOStencil)));
 }
+
 
 
 
